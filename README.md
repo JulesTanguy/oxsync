@@ -17,7 +17,7 @@ Options:
   -e, --exclude <EXCLUDE>          Exclude file or dir from the <SOURCE_DIR>, can be used multiple times
       --no-temporary-editor-files  Exclude files with names ending by a tilde `~` [aliases: no-tmp]
       --no-creation-events         Ignore creation events [aliases: no-create]
-      --ide-mode                   Exclude `.git`, `.idea` dirs + enables `no-temporary-editor-files`, `no-creation-events` options [aliases: ide]
+      --ide-mode                   Exclude `.git`, `.idea` dirs + enables `no-temporary-editor-files` [aliases: ide]
       --statistics                 Display the time spent copying the file [aliases: stats]
       --copy-parallelism <COPY_PARALLELISM>
                                    Maximum number of files to copy concurrently [default: 1]

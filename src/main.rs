@@ -36,7 +36,7 @@ pub struct Args {
     /// Ignore creation events
     #[arg(long, visible_alias("no-create"))]
     no_creation_events: bool,
-    /// Exclude `.git`, `.idea` dirs + enables `no-temporary-editor-files`, `no-creation-events` options
+    /// Exclude `.git`, `.idea` dirs + enables `no-temporary-editor-files`
     #[arg(long, visible_alias("ide"))]
     ide_mode: bool,
     /// Display the time spent copying the file

@@ -55,24 +55,7 @@ impl Start {
                 )
             })?;
 
-        let mut excluded_paths = Vec::new();
-
-        for path in &args.exclude {
-            let full_path = if !path.starts_with(&args.source_dir) {
-                args.source_dir.as_path().join(path)
-            } else {
-                path.to_path_buf()
-            };
-
-            excluded_paths.push(Utils::path_to_verbatim(&full_path));
-        }
-
-        if args.ide_mode {
-            excluded_paths.push(Utils::path_to_verbatim(&args.source_dir.join(".idea")));
-            excluded_paths.push(Utils::path_to_verbatim(&args.source_dir.join(".git")));
-            args.no_temporary_editor_files = true;
-            args.no_creation_events = true;
-        }
+        let mut excluded_paths = Self::build_excluded_paths(&mut args);
 
         excluded_paths.shrink_to_fit();
         Utils::set_excluded_paths(excluded_paths);
@@ -92,5 +75,57 @@ impl Start {
         let watcher = RecommendedWatcher::new(move |res| tx.send(res).unwrap(), Config::default())?;
 
         Ok((watcher, UnboundedReceiverStream::new(rx)))
+    }
+
+    fn build_excluded_paths(args: &mut Args) -> Vec<std::path::PathBuf> {
+        let mut excluded_paths = Vec::new();
+
+        for path in &args.exclude {
+            let full_path = if !path.starts_with(&args.source_dir) {
+                args.source_dir.as_path().join(path)
+            } else {
+                path.to_path_buf()
+            };
+
+            excluded_paths.push(Utils::path_to_verbatim(&full_path));
+        }
+
+        if args.ide_mode {
+            excluded_paths.push(Utils::path_to_verbatim(&args.source_dir.join(".idea")));
+            excluded_paths.push(Utils::path_to_verbatim(&args.source_dir.join(".git")));
+            args.no_temporary_editor_files = true;
+        }
+
+        excluded_paths
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Start;
+    use crate::Args;
+    use std::path::PathBuf;
+
+    #[test]
+    fn ide_mode_keeps_creation_events_enabled() {
+        let source_dir = PathBuf::from("/tmp/source");
+        let mut args = Args {
+            source_dir: source_dir.clone(),
+            target_dir: PathBuf::from("/tmp/target"),
+            exclude: Vec::new(),
+            no_temporary_editor_files: false,
+            no_creation_events: false,
+            ide_mode: true,
+            statistics: false,
+            copy_parallelism: 1,
+            trace: false,
+        };
+
+        let excluded_paths = Start::build_excluded_paths(&mut args);
+
+        assert!(args.no_temporary_editor_files);
+        assert!(!args.no_creation_events);
+        assert!(excluded_paths.contains(&source_dir.join(".git")));
+        assert!(excluded_paths.contains(&source_dir.join(".idea")));
     }
 }

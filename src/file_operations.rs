@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -59,6 +60,11 @@ impl FileOperationsManager {
 
             let relative_path = v_path.strip_prefix(&Utils::args().source_dir).unwrap();
             let (dest_path, _) = Utils::get_destination_path_and_dirs(relative_path);
+
+            if v_path.is_dir() {
+                Self::sync_directory(file_store, emit_time, &v_path, &path_str).await;
+                continue;
+            }
 
             if let Some(path_metadata) = file_store.get(&v_path) {
                 match path_metadata.path_type {
@@ -298,6 +304,11 @@ impl FileOperationsManager {
                 continue;
             }
 
+            if v_path.is_dir() {
+                Self::sync_directory(file_store, emit_time, &v_path, &path_str).await;
+                continue;
+            }
+
             if v_path.is_file() && !dest_path.exists() {
                 let current_hash = if let Ok(file_content) = fs::read(&v_path).await {
                     Some(hash(&file_content))
@@ -402,6 +413,246 @@ impl FileOperationsManager {
             source_type: plan.source_type,
             current_hash: plan.current_hash,
         })
+    }
+
+    async fn sync_directory(
+        file_store: &mut LruCache<PathBuf, PathMetadata>,
+        emit_time: Instant,
+        source_root: &Path,
+        path_str: &str,
+    ) {
+        let relative_path = source_root.strip_prefix(&Utils::args().source_dir).unwrap();
+        let dest_root = Utils::get_destination_path(relative_path);
+
+        if !dest_root.exists()
+            && Utils::create_dirs(&dest_root, path_str, &emit_time, false)
+                .await
+                .is_err()
+        {
+            return;
+        }
+
+        Self::write_in_file_store(file_store, source_root.to_path_buf(), PathType::Dir, None).await;
+
+        let mut copy_plans = Vec::new();
+        let mut seen_sources = HashSet::new();
+        let mut dir_stack = vec![source_root.to_path_buf()];
+
+        while let Some(current_dir) = dir_stack.pop() {
+            seen_sources.insert(current_dir.clone());
+
+            let mut entries = match fs::read_dir(&current_dir).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    err!(
+                        "failed to read dir '{}', error: {}",
+                        Utils::fmt_path(&current_dir),
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(err) => {
+                        err!(
+                            "failed to iterate dir '{}', error: {}",
+                            Utils::fmt_path(&current_dir),
+                            err
+                        );
+                        break;
+                    }
+                };
+
+                let source_path = Utils::path_to_verbatim(&entry.path());
+
+                if is_in_excluded_paths(&source_path) {
+                    continue;
+                }
+
+                let child_relative = source_path.strip_prefix(&Utils::args().source_dir).unwrap();
+                let child_path_str = child_relative.to_string_lossy().to_string();
+
+                if Utils::args().no_temporary_editor_files && child_path_str.ends_with('~') {
+                    continue;
+                }
+
+                let child_dest = Utils::get_destination_path(child_relative);
+                let file_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(err) => {
+                        err!(
+                            "failed to get file type for '{}', error: {}",
+                            child_path_str,
+                            err
+                        );
+                        continue;
+                    }
+                };
+
+                seen_sources.insert(source_path.clone());
+
+                if file_type.is_dir() {
+                    if !child_dest.exists()
+                        && Utils::create_dirs(&child_dest, &child_path_str, &emit_time, false)
+                            .await
+                            .is_err()
+                    {
+                        continue;
+                    }
+
+                    Self::write_in_file_store(file_store, source_path.clone(), PathType::Dir, None)
+                        .await;
+                    dir_stack.push(source_path);
+                    continue;
+                }
+
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                if let Some(plan) = Self::build_copy_plan_for_file(
+                    file_store,
+                    source_path,
+                    child_dest,
+                    child_path_str,
+                )
+                .await
+                {
+                    copy_plans.push(plan);
+                }
+            }
+        }
+
+        let copy_outcomes = Self::execute_copy_plans(copy_plans, emit_time).await;
+
+        for outcome in copy_outcomes {
+            Self::write_in_file_store(
+                file_store,
+                outcome.source_path,
+                outcome.source_type,
+                outcome.current_hash,
+            )
+            .await;
+        }
+
+        Self::remove_missing_entries(
+            file_store,
+            emit_time,
+            source_root,
+            &dest_root,
+            &seen_sources,
+        )
+        .await;
+    }
+
+    async fn build_copy_plan_for_file(
+        file_store: &LruCache<PathBuf, PathMetadata>,
+        source_path: PathBuf,
+        dest_path: PathBuf,
+        relative_path: String,
+    ) -> Option<CopyPlan> {
+        let current_hash = fs::read(&source_path)
+            .await
+            .ok()
+            .map(|content| hash(&content));
+
+        if let Some(path_metadata) = file_store.peek(&source_path) {
+            if path_metadata.path_type == PathType::File
+                && current_hash.is_some()
+                && current_hash == path_metadata.hash
+                && dest_path.is_file()
+            {
+                return None;
+            }
+        }
+
+        Some(CopyPlan {
+            source_path,
+            dest_path,
+            relative_path,
+            source_type: PathType::File,
+            current_hash,
+        })
+    }
+
+    async fn remove_missing_entries(
+        file_store: &mut LruCache<PathBuf, PathMetadata>,
+        emit_time: Instant,
+        source_root: &Path,
+        dest_root: &Path,
+        seen_sources: &HashSet<PathBuf>,
+    ) {
+        let mut dir_stack = vec![dest_root.to_path_buf()];
+
+        while let Some(current_dest) = dir_stack.pop() {
+            let mut entries = match fs::read_dir(&current_dest).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(_) => break,
+                };
+
+                let dest_path = entry.path();
+                let relative_path = match dest_path.strip_prefix(&Utils::args().target_dir) {
+                    Ok(relative_path) => relative_path,
+                    Err(_) => continue,
+                };
+
+                let source_path =
+                    Utils::path_to_verbatim(&Utils::args().source_dir.join(relative_path));
+
+                if is_in_excluded_paths(&source_path) {
+                    continue;
+                }
+
+                if seen_sources.contains(&source_path) {
+                    if entry
+                        .file_type()
+                        .await
+                        .map(|ft| ft.is_dir())
+                        .unwrap_or(false)
+                    {
+                        dir_stack.push(dest_path);
+                    }
+                    continue;
+                }
+
+                let entry_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+
+                let relative_str = relative_path.to_string_lossy().to_string();
+
+                if entry_type.is_dir() {
+                    if let Err(err) = fs::remove_dir_all(&dest_path).await {
+                        handle_remove_err(err, &relative_str, PathType::Dir);
+                    } else {
+                        Utils::print_action("deleted", "dir", &relative_str, &emit_time);
+                    }
+                } else if entry_type.is_file() {
+                    if let Err(err) = fs::remove_file(&dest_path).await {
+                        handle_remove_err(err, &relative_str, PathType::File);
+                    } else {
+                        Utils::print_action("deleted", "file", &relative_str, &emit_time);
+                    }
+                }
+
+                file_store.pop(&source_path);
+            }
+        }
+
+        file_store.pop(&Utils::path_to_verbatim(source_root));
+        Self::write_in_file_store(file_store, source_root.to_path_buf(), PathType::Dir, None).await;
     }
 
     async fn write_in_file_store(
@@ -679,6 +930,32 @@ mod tests {
         assert_eq!(
             fs::read_to_string(target_case.join(sibling_relative)).unwrap(),
             "{\"stable\":true}"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_modify_event_syncs_new_files_added_under_existing_directory() {
+        let (source_case, target_case) = next_case_dirs("dir-modify-create");
+        let mut store = new_store();
+
+        let existing = source_case.join("tools/parser/debug-template-parser.cpp");
+        write_small_file(&existing, "int existing = 1;\n");
+
+        FileOperationsManager::create(&mut store, Instant::now(), create_event([existing.clone()]))
+            .await;
+
+        let missing_before = target_case.join("tools/parser/CMakeLists.txt");
+        assert!(!missing_before.exists());
+
+        let added = source_case.join("tools/parser/CMakeLists.txt");
+        write_small_file(&added, "add_library(parser)\n");
+
+        let parent_dir = source_case.join("tools/parser");
+        FileOperationsManager::copy(&mut store, Instant::now(), modify_event([parent_dir])).await;
+
+        assert_eq!(
+            fs::read_to_string(target_case.join("tools/parser/CMakeLists.txt")).unwrap(),
+            "add_library(parser)\n"
         );
     }
 
