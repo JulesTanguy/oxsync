@@ -33,6 +33,10 @@ impl Start {
             ));
         }
 
+        if args.copy_parallelism == 0 {
+            return Err("copy parallelism must be greater than 0".to_string());
+        }
+
         args.source_dir = canonicalize(Path::new(&args.source_dir))
             .await
             .map_err(|_| {

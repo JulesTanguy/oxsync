@@ -19,6 +19,8 @@ Options:
       --no-creation-events         Ignore creation events [aliases: no-create]
       --ide-mode                   Exclude `.git`, `.idea` dirs + enables `no-temporary-editor-files`, `no-creation-events` options [aliases: ide]
       --statistics                 Display the time spent copying the file [aliases: stats]
+      --copy-parallelism <COPY_PARALLELISM>
+                                   Maximum number of files to copy concurrently [default: 1]
       --trace                      Set the log level to trace
   -h, --help                       Print help
   -V, --version                    Print version

@@ -42,6 +42,9 @@ pub struct Args {
     /// Display the time spent copying the file
     #[arg(long, visible_alias("stats"))]
     statistics: bool,
+    /// Maximum number of files to copy concurrently
+    #[arg(long, default_value_t = 1)]
+    copy_parallelism: usize,
     /// Set the log level to trace
     #[arg(long)]
     trace: bool,
