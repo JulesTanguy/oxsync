@@ -7,7 +7,7 @@ Sync changes from a directory to another
 ```
 Sync changes from a directory to another
 
-Usage: oxsync.exe [OPTIONS] <SOURCE_DIR> <TARGET_DIR>
+Usage: oxsync [OPTIONS] <SOURCE_DIR> <TARGET_DIR>
 
 Arguments:
   <SOURCE_DIR>  Path of the directory to watch changes from
@@ -35,7 +35,7 @@ while the tool monitors and synchronizes the modifications performed when the pr
 - Local copy of remote directories for quick reads.
 - Handle big and small files
 - An "exclude" argument
-- Tested and fully functional on Windows
+- Validated on Linux and intended to work across platforms supported by `notify`
 
 ## Installation
 ```sh

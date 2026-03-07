@@ -1,7 +1,9 @@
 use core::fmt::Debug;
-use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::abort;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+#[cfg(windows)]
+use std::path::{Component, Prefix};
 
 use blake3::Hash;
 use lru::LruCache;
@@ -48,35 +50,40 @@ impl Utils {
     }
 
     pub fn fmt_path(path: &Path) -> String {
-        if let Some(path_str) = path.to_str() {
-            // Check if the path starts with the prefix and remove the first three characters
-            return path_str
-                .strip_prefix(r"\\?\")
-                .map_or_else(|| path_str.to_owned(), |stripped| stripped.to_string());
+        let path_str = path.to_string_lossy();
+        if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+            stripped.to_string()
+        } else {
+            path_str.into_owned()
         }
-
-        err!("Path contains invalid Unicode");
-        abort()
     }
 
     /// See `https://github.com/dherman/verbatim`
     pub fn path_to_verbatim(path: &Path) -> PathBuf {
-        let mut components = path.components();
-        match components.next() {
-            Some(Component::Prefix(prefix)) => {
-                let new_prefix = match prefix.kind() {
-                    Prefix::Disk(letter) => {
-                        let new_prefix_string =
-                            format!(r"\\?\{}:\", String::from_utf8_lossy(&[letter]));
-                        let new_prefix = Path::new(&new_prefix_string).to_path_buf();
-                        new_prefix
-                    }
-                    _ => return path.to_path_buf(),
-                };
-                new_prefix.join(components)
+        #[cfg(not(windows))]
+        {
+            path.to_path_buf()
+        }
+
+        #[cfg(windows)]
+        {
+            let mut components = path.components();
+            match components.next() {
+                Some(Component::Prefix(prefix)) => {
+                    let new_prefix = match prefix.kind() {
+                        Prefix::Disk(letter) => {
+                            let new_prefix_string =
+                                format!(r"\\?\{}:\", String::from_utf8_lossy(&[letter]));
+                            let new_prefix = Path::new(&new_prefix_string).to_path_buf();
+                            new_prefix
+                        }
+                        _ => return path.to_path_buf(),
+                    };
+                    new_prefix.join(components)
+                }
+                Some(other) => Path::new(r"\\?\").join(Path::new(&other)).join(components),
+                _ => path.to_path_buf(),
             }
-            Some(other) => Path::new(r"\\?\").join(Path::new(&other)).join(components),
-            _ => path.to_path_buf(),
         }
     }
 

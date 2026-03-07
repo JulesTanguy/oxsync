@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::abort;
 
 use clap::Parser;
 use notify::{Config, Event, RecommendedWatcher, Watcher};
@@ -13,46 +12,44 @@ use crate::{Args, LOG_TRACE};
 pub(crate) struct Start;
 
 impl Start {
-    pub async fn parse_args() {
+    pub async fn parse_args() -> Result<(), String> {
         let mut args = Args::parse();
 
-        LOG_TRACE.set(args.trace).unwrap();
+        LOG_TRACE
+            .set(args.trace)
+            .map_err(|_| "trace logging was initialized more than once".to_string())?;
 
         if !Path::new(&args.source_dir).exists() {
-            eprintln!(
-                "source dir : '{}' does not exists",
+            return Err(format!(
+                "source dir '{}' does not exist",
                 Utils::fmt_path(&args.source_dir)
-            );
-            abort()
+            ));
         }
 
         if !Path::new(&args.target_dir).exists() {
-            eprintln!(
-                "target dir : '{}' does not exists",
+            return Err(format!(
+                "target dir '{}' does not exist",
                 Utils::fmt_path(&args.target_dir)
-            );
-            abort()
+            ));
         }
 
         args.source_dir = canonicalize(Path::new(&args.source_dir))
             .await
-            .unwrap_or_else(|_| {
-                eprintln!(
-                    "impossible to convert source dir '{}' to a valid path",
+            .map_err(|_| {
+                format!(
+                    "unable to convert source dir '{}' to a valid path",
                     Utils::fmt_path(&args.source_dir)
-                );
-                abort()
-            });
+                )
+            })?;
 
         args.target_dir = canonicalize(Path::new(&args.target_dir))
             .await
-            .unwrap_or_else(|_| {
-                eprintln!(
-                    "impossible to convert target dir '{}' to a valid path",
+            .map_err(|_| {
+                format!(
+                    "unable to convert target dir '{}' to a valid path",
                     Utils::fmt_path(&args.target_dir)
-                );
-                abort()
-            });
+                )
+            })?;
 
         let mut excluded_paths = Vec::new();
 
@@ -77,6 +74,7 @@ impl Start {
         Utils::set_excluded_paths(excluded_paths);
 
         Utils::set_args(args);
+        Ok(())
     }
 
     pub fn fs_watcher() -> notify::Result<(

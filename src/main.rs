@@ -1,8 +1,6 @@
-use std::hash::BuildHasherDefault;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use ahash::AHasher;
 use clap::Parser;
 use lru::LruCache;
 use notify::{RecursiveMode, Watcher};
@@ -51,12 +49,13 @@ pub struct Args {
 
 pub static LOG_TRACE: OnceCell<bool> = OnceCell::const_new();
 
-#[cfg(not(windows))]
-compile_error!("non-windows targets aren't supported on this version");
-
 #[tokio::main]
 async fn main() {
-    Start::parse_args().await;
+    if let Err(e) = Start::parse_args().await {
+        err!("{}", e);
+        return;
+    }
+
     if let Err(e) = init_event_loop().await {
         err!("{}", e);
     };
@@ -69,10 +68,8 @@ async fn init_event_loop() -> notify::Result<()> {
     // below will be monitored for changes.
     watcher.watch(&Utils::args().source_dir, RecursiveMode::Recursive)?;
 
-    let mut file_store: LruCache<PathBuf, PathMetadata> = LruCache::with_hasher(
-        NonZeroUsize::new(32_768).unwrap(),
-        BuildHasherDefault::<AHasher>::default(),
-    );
+    let mut file_store: LruCache<PathBuf, PathMetadata> =
+        LruCache::new(NonZeroUsize::new(32_768).unwrap());
 
     let mut rename_from: Option<PathBuf> = None;
 

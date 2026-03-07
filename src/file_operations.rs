@@ -7,7 +7,6 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::Event;
 use notify::EventKind::Modify;
 use tokio::fs;
-use tokio::fs::File;
 use tokio::time::Instant;
 
 use crate::utils::{PathType, Utils};
@@ -284,15 +283,18 @@ impl FileOperationsManager {
             if v_path.is_file() && !dest_path.exists() {
                 Self::create_depends_dirs(dirs, path_str, file_store, &emit_time).await;
 
-                if let Err(err) = File::create(dest_path).await {
-                    err!(
-                        "failed to create '{}', error: {}",
-                        path_str,
-                        err.to_string()
-                    );
-                } else {
-                    Utils::print_action("created", "file", path_str, &emit_time);
-                    Self::write_in_file_store(file_store, v_path, PathType::File, None).await;
+                if Utils::copy_file(&v_path, &dest_path, path_str, emit_time)
+                    .await
+                    .is_ok()
+                {
+                    let current_hash = if let Ok(file_content) = fs::read(&v_path).await {
+                        Some(hash(&file_content))
+                    } else {
+                        None
+                    };
+
+                    Self::write_in_file_store(file_store, v_path, PathType::File, current_hash)
+                        .await;
                 }
                 continue;
             }
@@ -304,7 +306,6 @@ impl FileOperationsManager {
                     .await
                     .is_ok()
                 {
-                    Utils::print_action("created", "dir", path_str, &emit_time);
                     Self::write_in_file_store(file_store, v_path, PathType::Dir, None).await;
                 }
             }
