@@ -472,9 +472,9 @@ impl FileOperationsManager {
         source_root: &Path,
         path_str: &str,
     ) {
-        let relative_path = match source_root.strip_prefix(&Utils::args().source_dir) {
-            Ok(relative_path) => relative_path.to_path_buf(),
-            Err(_) => {
+        let relative_path = match source_relative_path(source_root) {
+            Some(relative_path) => relative_path,
+            None => {
                 warn!(
                     "skipping directory outside source dir: '{}'",
                     Utils::fmt_path(source_root)
@@ -527,15 +527,15 @@ impl FileOperationsManager {
                     }
                 };
 
-                let source_path = Utils::path_to_verbatim(&entry.path());
+                let source_path = entry.path();
 
                 if is_in_excluded_paths(&source_path) {
                     continue;
                 }
 
-                let child_relative = match source_path.strip_prefix(&Utils::args().source_dir) {
-                    Ok(relative_path) => relative_path.to_path_buf(),
-                    Err(_) => {
+                let child_relative = match source_relative_path(&source_path) {
+                    Some(relative_path) => relative_path,
+                    None => {
                         warn!(
                             "skipping path outside source dir: '{}'",
                             Utils::fmt_path(&source_path)
@@ -678,8 +678,7 @@ impl FileOperationsManager {
                     Err(_) => continue,
                 };
 
-                let source_path =
-                    Utils::path_to_verbatim(&Utils::args().source_dir.join(relative_path));
+                let source_path = Utils::args().source_dir.join(relative_path);
 
                 if is_in_excluded_paths(&source_path) {
                     continue;
@@ -722,7 +721,7 @@ impl FileOperationsManager {
             }
         }
 
-        file_store.pop(&Utils::path_to_verbatim(source_root));
+        file_store.pop(source_root);
         Self::write_in_file_store(file_store, source_root.to_path_buf(), PathType::Dir, None).await;
     }
 
@@ -767,18 +766,18 @@ impl FileOperationsManager {
 }
 
 fn map_source_event_path(path: &Path) -> Option<(PathBuf, PathBuf, String)> {
-    let v_path = Utils::path_to_verbatim(path);
+    let source_path = path.to_path_buf();
 
-    if is_in_excluded_paths(&v_path) {
+    if is_in_excluded_paths(&source_path) {
         return None;
     }
 
-    let relative_path = match v_path.strip_prefix(&Utils::args().source_dir) {
-        Ok(relative_path) => relative_path.to_path_buf(),
-        Err(_) => {
+    let relative_path = match source_relative_path(&source_path) {
+        Some(relative_path) => relative_path,
+        None => {
             warn!(
                 "skipping event path outside source dir: '{}'",
-                Utils::fmt_path(&v_path)
+                Utils::fmt_path(&source_path)
             );
             return None;
         }
@@ -789,7 +788,21 @@ fn map_source_event_path(path: &Path) -> Option<(PathBuf, PathBuf, String)> {
         return None;
     }
 
-    Some((v_path, relative_path, path_str))
+    Some((source_path, relative_path, path_str))
+}
+
+fn source_relative_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(relative_path) = path.strip_prefix(&Utils::args().source_dir) {
+        return Some(relative_path.to_path_buf());
+    }
+
+    let verbatim_path = Utils::path_to_verbatim(path);
+    let verbatim_source_dir = Utils::path_to_verbatim(&Utils::args().source_dir);
+
+    verbatim_path
+        .strip_prefix(verbatim_source_dir)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 async fn path_type(path: &Path) -> Option<PathType> {
@@ -829,8 +842,12 @@ fn is_in_excluded_paths(path: &Path) -> bool {
         return false;
     }
 
+    let verbatim_path = Utils::path_to_verbatim(path);
+
     for excluded_path in Utils::excluded_paths() {
-        if path.starts_with(excluded_path) {
+        if path.starts_with(excluded_path)
+            || verbatim_path.starts_with(Utils::path_to_verbatim(excluded_path).as_path())
+        {
             return true;
         }
     }

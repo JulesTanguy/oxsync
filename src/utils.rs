@@ -83,7 +83,7 @@ impl Utils {
                     };
                     new_prefix.join(components)
                 }
-                Some(other) => Path::new(r"\\?\").join(Path::new(&other)).join(components),
+                Some(_) => path.to_path_buf(),
                 _ => path.to_path_buf(),
             }
         }
