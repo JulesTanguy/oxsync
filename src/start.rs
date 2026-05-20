@@ -3,8 +3,8 @@ use std::path::Path;
 use clap::Parser;
 use notify::{Config, Event, RecommendedWatcher, Watcher};
 use tokio::fs::canonicalize;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc::channel;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::utils::Utils;
 use crate::{Args, LOG_TRACE};
@@ -64,17 +64,22 @@ impl Start {
         Ok(())
     }
 
-    pub fn fs_watcher() -> notify::Result<(
-        RecommendedWatcher,
-        UnboundedReceiverStream<notify::Result<Event>>,
-    )> {
-        let (tx, rx) = unbounded_channel();
+    pub fn fs_watcher()
+    -> notify::Result<(RecommendedWatcher, ReceiverStream<notify::Result<Event>>)> {
+        let (tx, rx) = channel(4096);
 
         // Automatically select the best implementation for your platform.
         // You can also access each implementation directly e.g. INotifyWatcher.
-        let watcher = RecommendedWatcher::new(move |res| tx.send(res).unwrap(), Config::default())?;
+        let watcher = RecommendedWatcher::new(
+            move |res| {
+                if tx.blocking_send(res).is_err() {
+                    crate::warn!("watch event receiver was dropped");
+                }
+            },
+            Config::default(),
+        )?;
 
-        Ok((watcher, UnboundedReceiverStream::new(rx)))
+        Ok((watcher, ReceiverStream::new(rx)))
     }
 
     fn build_excluded_paths(args: &mut Args) -> Vec<std::path::PathBuf> {

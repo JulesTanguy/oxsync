@@ -2,19 +2,24 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use blake3::{hash, Hash};
+use blake3::Hash;
 use lru::LruCache;
-use notify::event::{ModifyKind, RenameMode};
 use notify::Event;
 use notify::EventKind::Modify;
+use notify::event::{ModifyKind, RenameMode};
 use tokio::fs;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::utils::{PathType, Utils};
-use crate::{err, info, PathMetadata};
+use crate::{PathMetadata, err, info, warn};
 
 pub(crate) struct FileOperationsManager;
+
+pub(crate) struct RenameFrom {
+    source_path: PathBuf,
+    dest_path: PathBuf,
+}
 
 #[derive(Clone)]
 struct CopyPlan {
@@ -22,7 +27,6 @@ struct CopyPlan {
     dest_path: PathBuf,
     relative_path: String,
     source_type: PathType,
-    current_hash: Option<Hash>,
 }
 
 struct CopyOutcome {
@@ -41,27 +45,12 @@ impl FileOperationsManager {
 
         // "paths" length is always 1 on Windows
         for src_path in event.paths {
-            let v_path = Utils::path_to_verbatim(&src_path);
-
-            if is_in_excluded_paths(&v_path) {
+            let Some((v_path, relative_path, path_str)) = map_source_event_path(&src_path) else {
                 continue;
-            }
+            };
+            let (dest_path, _) = Utils::get_destination_path_and_dirs(&relative_path);
 
-            let path_str = v_path
-                .strip_prefix(&Utils::args().source_dir)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-
-            if Utils::args().no_temporary_editor_files && path_str.ends_with('~') {
-                continue;
-            }
-
-            let relative_path = v_path.strip_prefix(&Utils::args().source_dir).unwrap();
-            let (dest_path, _) = Utils::get_destination_path_and_dirs(relative_path);
-
-            if v_path.is_dir() {
+            if path_type(&v_path).await == Some(PathType::Dir) {
                 Self::sync_directory(file_store, emit_time, &v_path, &path_str).await;
                 continue;
             }
@@ -69,7 +58,7 @@ impl FileOperationsManager {
             if let Some(path_metadata) = file_store.get(&v_path) {
                 match path_metadata.path_type {
                     PathType::Dir => {
-                        if !dest_path.is_dir()
+                        if path_type(&dest_path).await != Some(PathType::Dir)
                             && Utils::create_dirs(&dest_path, &path_str, &emit_time, false)
                                 .await
                                 .is_ok()
@@ -79,11 +68,7 @@ impl FileOperationsManager {
                         }
                     }
                     PathType::File => {
-                        let current_hash = if let Ok(file_content) = fs::read(&v_path).await {
-                            Some(hash(&file_content))
-                        } else {
-                            None
-                        };
+                        let current_hash = Utils::hash_file(&v_path).await.ok();
 
                         if current_hash.is_none() {
                             copy_plans.push(CopyPlan {
@@ -91,7 +76,6 @@ impl FileOperationsManager {
                                 dest_path,
                                 relative_path: path_str.clone(),
                                 source_type: PathType::File,
-                                current_hash: None,
                             });
                             continue;
                         }
@@ -99,7 +83,7 @@ impl FileOperationsManager {
                         let file_is_identical = current_hash == path_metadata.hash;
                         let last_change_superior_to_one_sec = SystemTime::now()
                             .duration_since(path_metadata.last_change)
-                            .unwrap()
+                            .unwrap_or_default()
                             .as_millis()
                             > 1000;
 
@@ -111,7 +95,6 @@ impl FileOperationsManager {
                                 dest_path,
                                 relative_path: path_str.clone(),
                                 source_type: PathType::File,
-                                current_hash,
                             });
                         }
                     }
@@ -119,19 +102,18 @@ impl FileOperationsManager {
                 continue;
             }
 
-            if v_path.is_file() {
+            if path_type(&v_path).await == Some(PathType::File) {
                 copy_plans.push(CopyPlan {
                     source_path: v_path,
                     dest_path,
                     relative_path: path_str.clone(),
                     source_type: PathType::File,
-                    current_hash: None,
                 });
                 continue;
             }
 
-            if v_path.is_dir()
-                && !dest_path.is_dir()
+            if path_type(&v_path).await == Some(PathType::Dir)
+                && path_type(&dest_path).await != Some(PathType::Dir)
                 && Utils::create_dirs(&dest_path, &path_str, &emit_time, false)
                     .await
                     .is_ok()
@@ -160,43 +142,32 @@ impl FileOperationsManager {
     ) {
         // "paths" length is always 1 on Windows
         for src_path in event.paths {
-            let v_path = Utils::path_to_verbatim(&src_path);
-
-            if is_in_excluded_paths(&v_path) {
+            let Some((v_path, relative_path, path_str)) = map_source_event_path(&src_path) else {
                 continue;
-            }
-            let path_str = v_path
-                .strip_prefix(&Utils::args().source_dir)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
+            };
+            let dest_path = Utils::get_destination_path(&relative_path);
 
-            if Utils::args().no_temporary_editor_files && path_str.ends_with('~') {
-                continue;
-            }
-
-            let relative_path = v_path.strip_prefix(&Utils::args().source_dir).unwrap();
-            let dest_path = Utils::get_destination_path(relative_path);
-
-            if !dest_path.exists() {
-                return;
-            } else if dest_path.is_file() {
-                if let Err(err) = fs::remove_file(dest_path).await {
-                    handle_remove_err(err, &path_str, PathType::File);
-                } else {
-                    Utils::print_action("deleted", "file", &path_str, &emit_time);
-                };
-                file_store.pop(&v_path);
-            } else if dest_path.is_dir() {
-                if let Err(err) = fs::remove_dir_all(dest_path).await {
-                    handle_remove_err(err, &path_str, PathType::Dir);
-                } else {
-                    Utils::print_action("deleted", "dir", &path_str, &emit_time);
-                };
-                file_store.pop(&v_path);
-            } else {
-                err!("remove error: '{}' is not a file or a directory", path_str);
+            match path_type(&dest_path).await {
+                None => {
+                    file_store.pop(&v_path);
+                    continue;
+                }
+                Some(PathType::File) => {
+                    if let Err(err) = fs::remove_file(&dest_path).await {
+                        handle_remove_err(err, &path_str, PathType::File);
+                    } else {
+                        Utils::print_action("deleted", "file", &path_str, &emit_time);
+                    };
+                    file_store.pop(&v_path);
+                }
+                Some(PathType::Dir) => {
+                    if let Err(err) = fs::remove_dir_all(&dest_path).await {
+                        handle_remove_err(err, &path_str, PathType::Dir);
+                    } else {
+                        Utils::print_action("deleted", "dir", &path_str, &emit_time);
+                    };
+                    file_store.pop(&v_path);
+                }
             }
         }
     }
@@ -205,66 +176,28 @@ impl FileOperationsManager {
         file_store: &mut LruCache<PathBuf, PathMetadata>,
         emit_time: Instant,
         event: Event,
-        rename_from: &mut Option<PathBuf>,
+        rename_from: &mut Option<RenameFrom>,
     ) {
         // "paths" length is always 1 on Windows
         for src_path in event.paths {
-            let v_path = Utils::path_to_verbatim(&src_path);
-
-            if is_in_excluded_paths(&v_path) {
+            let Some((v_path, relative_path, path_str)) = map_source_event_path(&src_path) else {
                 continue;
-            }
-
-            let path_str = v_path
-                .strip_prefix(&Utils::args().source_dir)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-
-            if Utils::args().no_temporary_editor_files && path_str.ends_with('~') {
-                continue;
-            }
-
-            let relative_path = v_path.strip_prefix(&Utils::args().source_dir).unwrap();
-            let (dest_path, _) = Utils::get_destination_path_and_dirs(relative_path);
+            };
+            let (dest_path, _) = Utils::get_destination_path_and_dirs(&relative_path);
 
             match event.kind {
                 Modify(ModifyKind::Name(RenameMode::From)) => {
-                    *rename_from = Some(dest_path);
+                    *rename_from = Some(RenameFrom {
+                        source_path: v_path,
+                        dest_path,
+                    });
                 }
                 Modify(ModifyKind::Name(RenameMode::To)) => {
-                    if rename_from.is_some() {
-                        let old_path = rename_from.take().unwrap();
-
-                        if fs::rename(&old_path, dest_path).await.is_ok() {
-                            let path_type;
-                            let path_type_str;
-                            if v_path.is_file() {
-                                path_type = PathType::File;
-                                path_type_str = "file";
-                            } else if v_path.is_dir() {
-                                path_type = PathType::Dir;
-                                path_type_str = "dir";
-                            } else {
-                                err!("'{}' is not a file or a directory", path_str);
-                                return;
-                            };
-
-                            Utils::print_action("renamed", path_type_str, &path_str, &emit_time);
-
-                            if let Some(mut metadata) = file_store.pop(&old_path) {
-                                metadata.last_change = SystemTime::now();
-                                file_store.put(v_path, metadata);
-                            } else {
-                                let metadata = PathMetadata {
-                                    path_type,
-                                    hash: None,
-                                    last_change: SystemTime::now(),
-                                };
-                                file_store.put(v_path, metadata);
-                            }
-                        }
+                    if let Some(old_path) = rename_from.take() {
+                        Self::finish_rename(
+                            file_store, emit_time, old_path, v_path, dest_path, path_str,
+                        )
+                        .await;
                     }
                 }
                 _ => {}
@@ -280,53 +213,32 @@ impl FileOperationsManager {
         let mut copy_plans = Vec::new();
 
         for src_path in event.paths {
-            let v_path = Utils::path_to_verbatim(&src_path);
-
-            if is_in_excluded_paths(&v_path) {
+            let Some((v_path, relative_path, path_str)) = map_source_event_path(&src_path) else {
                 continue;
-            }
-
-            let path_str = v_path
-                .strip_prefix(&Utils::args().source_dir)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-
-            if Utils::args().no_temporary_editor_files && path_str.ends_with('~') {
-                continue;
-            }
-
-            let relative_path = v_path.strip_prefix(&Utils::args().source_dir).unwrap();
-            let (dest_path, dirs) = Utils::get_destination_path_and_dirs(relative_path);
+            };
+            let (dest_path, dirs) = Utils::get_destination_path_and_dirs(&relative_path);
 
             if file_store.get(&v_path).is_some() {
                 continue;
             }
 
-            if v_path.is_dir() {
+            if path_type(&v_path).await == Some(PathType::Dir) {
                 Self::sync_directory(file_store, emit_time, &v_path, &path_str).await;
                 continue;
             }
 
-            if v_path.is_file() && !dest_path.exists() {
-                let current_hash = if let Ok(file_content) = fs::read(&v_path).await {
-                    Some(hash(&file_content))
-                } else {
-                    None
-                };
-
-                copy_plans.push(CopyPlan {
-                    source_path: v_path,
-                    dest_path,
-                    relative_path: path_str.to_string(),
-                    source_type: PathType::File,
-                    current_hash,
-                });
+            if path_type(&v_path).await == Some(PathType::File) {
+                if let Some(plan) =
+                    Self::build_copy_plan_for_file(file_store, v_path, dest_path, path_str).await
+                {
+                    copy_plans.push(plan);
+                }
                 continue;
             }
 
-            if v_path.is_dir() && !dest_path.exists() {
+            if path_type(&v_path).await == Some(PathType::Dir)
+                && path_type(&dest_path).await.is_none()
+            {
                 Self::create_depends_dirs(dirs, &path_str, file_store, &emit_time).await;
 
                 if Utils::create_dirs(&dest_path, &path_str, &emit_time, false)
@@ -385,6 +297,145 @@ impl FileOperationsManager {
         outcomes
     }
 
+    async fn finish_rename(
+        file_store: &mut LruCache<PathBuf, PathMetadata>,
+        emit_time: Instant,
+        old_path: RenameFrom,
+        new_source_path: PathBuf,
+        new_dest_path: PathBuf,
+        path_str: String,
+    ) {
+        let Some(new_type) = path_type(&new_source_path).await else {
+            err!("'{}' is not a file or a directory", path_str);
+            return;
+        };
+
+        match fs::rename(&old_path.dest_path, &new_dest_path).await {
+            Ok(()) => {
+                let path_type_str = match new_type {
+                    PathType::File => "file",
+                    PathType::Dir => "dir",
+                };
+                Utils::print_action("renamed", path_type_str, &path_str, &emit_time);
+                Self::migrate_file_store_after_rename(
+                    file_store,
+                    &old_path.source_path,
+                    &new_source_path,
+                    new_type,
+                );
+            }
+            Err(rename_err) => {
+                err!(
+                    "failed to rename '{}' to '{}', error: {}",
+                    Utils::fmt_path(&old_path.dest_path),
+                    Utils::fmt_path(&new_dest_path),
+                    rename_err
+                );
+                Self::fallback_after_failed_rename(
+                    file_store,
+                    emit_time,
+                    &old_path,
+                    &new_source_path,
+                    &new_dest_path,
+                    &path_str,
+                    new_type,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn fallback_after_failed_rename(
+        file_store: &mut LruCache<PathBuf, PathMetadata>,
+        emit_time: Instant,
+        old_path: &RenameFrom,
+        new_source_path: &Path,
+        new_dest_path: &Path,
+        path_str: &str,
+        new_type: PathType,
+    ) {
+        match new_type {
+            PathType::File => {
+                let plan = CopyPlan {
+                    source_path: new_source_path.to_path_buf(),
+                    dest_path: new_dest_path.to_path_buf(),
+                    relative_path: path_str.to_string(),
+                    source_type: PathType::File,
+                };
+
+                let outcomes = Self::execute_copy_plans(vec![plan], emit_time).await;
+                if outcomes.is_empty() {
+                    return;
+                }
+
+                for outcome in outcomes {
+                    Self::write_in_file_store(
+                        file_store,
+                        outcome.source_path,
+                        outcome.source_type,
+                        outcome.current_hash,
+                    )
+                    .await;
+                }
+            }
+            PathType::Dir => {
+                Self::sync_directory(file_store, emit_time, new_source_path, path_str).await;
+            }
+        }
+
+        remove_destination_path(&old_path.dest_path, path_str, &emit_time).await;
+        Self::migrate_file_store_after_rename(
+            file_store,
+            &old_path.source_path,
+            new_source_path,
+            new_type,
+        );
+    }
+
+    fn migrate_file_store_after_rename(
+        file_store: &mut LruCache<PathBuf, PathMetadata>,
+        old_source_path: &Path,
+        new_source_path: &Path,
+        new_type: PathType,
+    ) {
+        let now = SystemTime::now();
+        let keys_to_move: Vec<PathBuf> = file_store
+            .iter()
+            .filter_map(|(path, _)| {
+                if path.starts_with(old_source_path) {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if keys_to_move.is_empty() {
+            file_store.put(
+                new_source_path.to_path_buf(),
+                PathMetadata {
+                    path_type: new_type,
+                    hash: None,
+                    last_change: now,
+                },
+            );
+            return;
+        }
+
+        for old_key in keys_to_move {
+            let Some(mut metadata) = file_store.pop(&old_key) else {
+                continue;
+            };
+            let new_key = match old_key.strip_prefix(old_source_path) {
+                Ok(relative) => new_source_path.join(relative),
+                Err(_) => new_source_path.to_path_buf(),
+            };
+
+            metadata.last_change = now;
+            file_store.put(new_key, metadata);
+        }
+    }
+
     async fn run_copy_plan(plan: CopyPlan, emit_time: Instant) -> Option<CopyOutcome> {
         let path = Path::new(&plan.relative_path);
         let (_, dirs) = Utils::get_destination_path_and_dirs(path);
@@ -396,22 +447,22 @@ impl FileOperationsManager {
             return None;
         }
 
-        if Utils::copy_file(
+        let current_hash = match Utils::copy_file(
             &plan.source_path,
             &plan.dest_path,
             &plan.relative_path,
             emit_time,
         )
         .await
-        .is_err()
         {
-            return None;
-        }
+            Ok(hash) => Some(hash),
+            Err(()) => return None,
+        };
 
         Some(CopyOutcome {
             source_path: plan.source_path,
             source_type: plan.source_type,
-            current_hash: plan.current_hash,
+            current_hash,
         })
     }
 
@@ -421,10 +472,19 @@ impl FileOperationsManager {
         source_root: &Path,
         path_str: &str,
     ) {
-        let relative_path = source_root.strip_prefix(&Utils::args().source_dir).unwrap();
-        let dest_root = Utils::get_destination_path(relative_path);
+        let relative_path = match source_root.strip_prefix(&Utils::args().source_dir) {
+            Ok(relative_path) => relative_path.to_path_buf(),
+            Err(_) => {
+                warn!(
+                    "skipping directory outside source dir: '{}'",
+                    Utils::fmt_path(source_root)
+                );
+                return;
+            }
+        };
+        let dest_root = Utils::get_destination_path(&relative_path);
 
-        if !dest_root.exists()
+        if path_type(&dest_root).await.is_none()
             && Utils::create_dirs(&dest_root, path_str, &emit_time, false)
                 .await
                 .is_err()
@@ -473,14 +533,23 @@ impl FileOperationsManager {
                     continue;
                 }
 
-                let child_relative = source_path.strip_prefix(&Utils::args().source_dir).unwrap();
+                let child_relative = match source_path.strip_prefix(&Utils::args().source_dir) {
+                    Ok(relative_path) => relative_path.to_path_buf(),
+                    Err(_) => {
+                        warn!(
+                            "skipping path outside source dir: '{}'",
+                            Utils::fmt_path(&source_path)
+                        );
+                        continue;
+                    }
+                };
                 let child_path_str = child_relative.to_string_lossy().to_string();
 
                 if Utils::args().no_temporary_editor_files && child_path_str.ends_with('~') {
                     continue;
                 }
 
-                let child_dest = Utils::get_destination_path(child_relative);
+                let child_dest = Utils::get_destination_path(&child_relative);
                 let file_type = match entry.file_type().await {
                     Ok(file_type) => file_type,
                     Err(err) => {
@@ -496,7 +565,7 @@ impl FileOperationsManager {
                 seen_sources.insert(source_path.clone());
 
                 if file_type.is_dir() {
-                    if !child_dest.exists()
+                    if path_type(&child_dest).await.is_none()
                         && Utils::create_dirs(&child_dest, &child_path_str, &emit_time, false)
                             .await
                             .is_err()
@@ -555,17 +624,20 @@ impl FileOperationsManager {
         dest_path: PathBuf,
         relative_path: String,
     ) -> Option<CopyPlan> {
-        let current_hash = fs::read(&source_path)
-            .await
-            .ok()
-            .map(|content| hash(&content));
+        let current_hash = Utils::hash_file(&source_path).await.ok();
 
-        if let Some(path_metadata) = file_store.peek(&source_path) {
-            if path_metadata.path_type == PathType::File
-                && current_hash.is_some()
-                && current_hash == path_metadata.hash
-                && dest_path.is_file()
-            {
+        if let Some(path_metadata) = file_store.peek(&source_path)
+            && path_metadata.path_type == PathType::File
+            && current_hash.is_some()
+            && current_hash == path_metadata.hash
+            && path_type(&dest_path).await == Some(PathType::File)
+        {
+            return None;
+        }
+
+        if path_type(&dest_path).await == Some(PathType::File) {
+            let dest_hash = Utils::hash_file(&dest_path).await.ok();
+            if current_hash.is_some() && current_hash == dest_hash {
                 return None;
             }
         }
@@ -575,7 +647,6 @@ impl FileOperationsManager {
             dest_path,
             relative_path,
             source_type: PathType::File,
-            current_hash,
         })
     }
 
@@ -685,13 +756,71 @@ impl FileOperationsManager {
         file_store: &mut LruCache<PathBuf, PathMetadata>,
         emit_time: &Instant,
     ) {
-        if !dirs.exists()
+        if path_type(&dirs).await.is_none()
             && Utils::create_dirs(&dirs, path_str, emit_time, true)
                 .await
                 .is_ok()
         {
             Self::write_in_file_store(file_store, dirs, PathType::Dir, None).await;
         }
+    }
+}
+
+fn map_source_event_path(path: &Path) -> Option<(PathBuf, PathBuf, String)> {
+    let v_path = Utils::path_to_verbatim(path);
+
+    if is_in_excluded_paths(&v_path) {
+        return None;
+    }
+
+    let relative_path = match v_path.strip_prefix(&Utils::args().source_dir) {
+        Ok(relative_path) => relative_path.to_path_buf(),
+        Err(_) => {
+            warn!(
+                "skipping event path outside source dir: '{}'",
+                Utils::fmt_path(&v_path)
+            );
+            return None;
+        }
+    };
+
+    let path_str = relative_path.to_string_lossy().to_string();
+    if Utils::args().no_temporary_editor_files && path_str.ends_with('~') {
+        return None;
+    }
+
+    Some((v_path, relative_path, path_str))
+}
+
+async fn path_type(path: &Path) -> Option<PathType> {
+    let metadata = fs::metadata(path).await.ok()?;
+
+    if metadata.is_file() {
+        Some(PathType::File)
+    } else if metadata.is_dir() {
+        Some(PathType::Dir)
+    } else {
+        None
+    }
+}
+
+async fn remove_destination_path(dest_path: &Path, path_str: &str, emit_time: &Instant) {
+    match path_type(dest_path).await {
+        Some(PathType::File) => {
+            if let Err(err) = fs::remove_file(dest_path).await {
+                handle_remove_err(err, path_str, PathType::File);
+            } else {
+                Utils::print_action("deleted", "file", path_str, emit_time);
+            }
+        }
+        Some(PathType::Dir) => {
+            if let Err(err) = fs::remove_dir_all(dest_path).await {
+                handle_remove_err(err, path_str, PathType::Dir);
+            } else {
+                Utils::print_action("deleted", "dir", path_str, emit_time);
+            }
+        }
+        None => {}
     }
 }
 
@@ -741,14 +870,14 @@ mod tests {
     use crate::utils::{PathMetadata, Utils};
     use crate::{Args, LOG_TRACE};
     use lru::LruCache;
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::Event;
     use notify::EventKind;
+    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::Instant;
 
@@ -844,6 +973,10 @@ mod tests {
             event = event.add_path(path);
         }
         event
+    }
+
+    fn rename_event(path: PathBuf, mode: RenameMode) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Name(mode))).add_path(path)
     }
 
     fn write_small_file(path: &Path, content: &str) {
@@ -993,5 +1126,117 @@ mod tests {
 
         let target_dir = target_case.join("packages/a");
         assert!(!target_dir.exists(), "target directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn remove_event_continues_after_missing_target_path() {
+        let (source_case, target_case) = next_case_dirs("remove-missing-continues");
+        let mut store = new_store();
+
+        let missing_source = source_case.join("already-gone.txt");
+        let source_to_remove = source_case.join("remove-me.txt");
+        let target_to_remove = target_case.join("remove-me.txt");
+        write_small_file(&target_to_remove, "target content");
+
+        FileOperationsManager::remove(
+            &mut store,
+            Instant::now(),
+            remove_event([missing_source, source_to_remove]),
+        )
+        .await;
+
+        assert!(!target_to_remove.exists());
+    }
+
+    #[tokio::test]
+    async fn create_event_overwrites_stale_existing_target_file() {
+        let (source_case, target_case) = next_case_dirs("create-overwrites-stale");
+        let mut store = new_store();
+
+        let source_file = source_case.join("settings.toml");
+        let target_file = target_case.join("settings.toml");
+        write_small_file(&source_file, "fresh = true\n");
+        write_small_file(&target_file, "fresh = false\n");
+
+        FileOperationsManager::create(
+            &mut store,
+            Instant::now(),
+            create_event([source_file.clone()]),
+        )
+        .await;
+
+        assert_eq!(fs::read_to_string(target_file).unwrap(), "fresh = true\n");
+    }
+
+    #[tokio::test]
+    async fn rename_event_migrates_source_keyed_file_metadata() {
+        let (source_case, target_case) = next_case_dirs("rename-file-metadata");
+        let mut store = new_store();
+
+        let old_source = source_case.join("old.txt");
+        let new_source = source_case.join("new.txt");
+        let old_target = target_case.join("old.txt");
+        let new_target = target_case.join("new.txt");
+        write_small_file(&old_source, "renamed");
+
+        FileOperationsManager::create(
+            &mut store,
+            Instant::now(),
+            create_event([old_source.clone()]),
+        )
+        .await;
+
+        fs::rename(&old_source, &new_source).unwrap();
+        let mut rename_from = None;
+        FileOperationsManager::rename(
+            &mut store,
+            Instant::now(),
+            rename_event(old_source.clone(), RenameMode::From),
+            &mut rename_from,
+        )
+        .await;
+
+        FileOperationsManager::rename(
+            &mut store,
+            Instant::now(),
+            rename_event(new_source.clone(), RenameMode::To),
+            &mut rename_from,
+        )
+        .await;
+
+        assert!(new_target.is_file());
+        assert!(!old_target.exists());
+        assert!(store.peek(&new_source).is_some());
+        assert!(store.peek(&old_source).is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_event_falls_back_to_copy_when_target_rename_fails() {
+        let (source_case, target_case) = next_case_dirs("rename-fallback-copy");
+        let mut store = new_store();
+
+        let old_source = source_case.join("missing-target-old.txt");
+        let new_source = source_case.join("new.txt");
+        let new_target = target_case.join("new.txt");
+        write_small_file(&new_source, "fallback content");
+
+        let mut rename_from = None;
+        FileOperationsManager::rename(
+            &mut store,
+            Instant::now(),
+            rename_event(old_source, RenameMode::From),
+            &mut rename_from,
+        )
+        .await;
+        FileOperationsManager::rename(
+            &mut store,
+            Instant::now(),
+            rename_event(new_source.clone(), RenameMode::To),
+            &mut rename_from,
+        )
+        .await;
+
+        assert_eq!(fs::read_to_string(new_target).unwrap(), "fallback content");
+        assert!(store.peek(&new_source).is_some());
     }
 }

@@ -10,11 +10,13 @@ use lru::LruCache;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
 
 use crate::file_operations::FileOperationsManager;
-use crate::{err, info, warn, Args};
+use crate::file_operations::RenameFrom;
+use crate::{Args, err, info, warn};
 
 pub struct Utils;
 
@@ -87,18 +89,47 @@ impl Utils {
         }
     }
 
+    pub async fn hash_file(path: &Path) -> std::io::Result<Hash> {
+        let mut file = fs::File::open(path).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0; 128 * 1024];
+
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        Ok(hasher.finalize())
+    }
+
     pub async fn copy_file(
         src_path: &Path,
         dest_path: &Path,
         path_str: &str,
         emit_time: Instant,
-    ) -> Result<(), ()> {
+    ) -> Result<Hash, ()> {
         if let Err(err) = fs::copy(src_path, dest_path).await {
             err!("failed to copy '{}', error: {}", path_str, err.to_string());
             Err(())
         } else {
-            Self::print_action("copied", "file", path_str, &emit_time);
-            Ok(())
+            match Self::hash_file(dest_path).await {
+                Ok(hash) => {
+                    Self::print_action("copied", "file", path_str, &emit_time);
+                    Ok(hash)
+                }
+                Err(err) => {
+                    err!(
+                        "failed to hash copied file '{}', error: {}",
+                        path_str,
+                        err.to_string()
+                    );
+                    Err(())
+                }
+            }
         }
     }
 
@@ -143,7 +174,7 @@ impl Utils {
         event: Event,
         file_store: &mut LruCache<PathBuf, PathMetadata>,
         emit_time: Instant,
-        rename_from: &mut Option<PathBuf>,
+        rename_from: &mut Option<RenameFrom>,
     ) {
         match event.kind {
             EventKind::Create(_) => {

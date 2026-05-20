@@ -11,9 +11,9 @@ repository = "https://github.com/JulesTanguy/oxsync/"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 lru = "0.16.3"
-notify = { version = "8.2.0", default-features = false }
+notify = "8.2.0"
 time = { version = "0.3.47", features = ["formatting", "alloc", "local-offset"] }
-tokio = { version = "1.50", features = ["fs", "sync", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.50", features = ["fs", "io-util", "sync", "rt-multi-thread", "macros", "time"] }
 tokio-stream = { version = "0.1.18", default-features = false }
 
 [profile.release]

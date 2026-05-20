@@ -8,6 +8,7 @@ use tokio::sync::OnceCell;
 use tokio::time::Instant;
 use tokio_stream::StreamExt;
 
+use file_operations::RenameFrom;
 use start::Start;
 use utils::PathMetadata;
 use utils::Utils;
@@ -56,11 +57,12 @@ pub static LOG_TRACE: OnceCell<bool> = OnceCell::const_new();
 async fn main() {
     if let Err(e) = Start::parse_args().await {
         err!("{}", e);
-        return;
+        std::process::exit(1);
     }
 
     if let Err(e) = init_event_loop().await {
         err!("{}", e);
+        std::process::exit(1);
     };
 }
 
@@ -74,7 +76,7 @@ async fn init_event_loop() -> notify::Result<()> {
     let mut file_store: LruCache<PathBuf, PathMetadata> =
         LruCache::new(NonZeroUsize::new(32_768).unwrap());
 
-    let mut rename_from: Option<PathBuf> = None;
+    let mut rename_from: Option<RenameFrom> = None;
 
     info!(
         "Ready - Waiting for changes on '{}'",
