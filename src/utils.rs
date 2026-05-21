@@ -111,25 +111,13 @@ impl Utils {
         dest_path: &Path,
         path_str: &str,
         emit_time: Instant,
-    ) -> Result<Hash, ()> {
+    ) -> Result<(), ()> {
         if let Err(err) = fs::copy(src_path, dest_path).await {
             err!("failed to copy '{}', error: {}", path_str, err.to_string());
             Err(())
         } else {
-            match Self::hash_file(dest_path).await {
-                Ok(hash) => {
-                    Self::print_action("copied", "file", path_str, &emit_time);
-                    Ok(hash)
-                }
-                Err(err) => {
-                    err!(
-                        "failed to hash copied file '{}', error: {}",
-                        path_str,
-                        err.to_string()
-                    );
-                    Err(())
-                }
-            }
+            Self::print_action("copied", "file", path_str, &emit_time);
+            Ok(())
         }
     }
 

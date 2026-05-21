@@ -27,6 +27,7 @@ struct CopyPlan {
     dest_path: PathBuf,
     relative_path: String,
     source_type: PathType,
+    source_hash: Option<Hash>,
 }
 
 struct CopyOutcome {
@@ -76,6 +77,7 @@ impl FileOperationsManager {
                                 dest_path,
                                 relative_path: path_str.clone(),
                                 source_type: PathType::File,
+                                source_hash: current_hash,
                             });
                             continue;
                         }
@@ -95,6 +97,7 @@ impl FileOperationsManager {
                                 dest_path,
                                 relative_path: path_str.clone(),
                                 source_type: PathType::File,
+                                source_hash: current_hash,
                             });
                         }
                     }
@@ -108,6 +111,7 @@ impl FileOperationsManager {
                     dest_path,
                     relative_path: path_str.clone(),
                     source_type: PathType::File,
+                    source_hash: None,
                 });
                 continue;
             }
@@ -361,6 +365,7 @@ impl FileOperationsManager {
                     dest_path: new_dest_path.to_path_buf(),
                     relative_path: path_str.to_string(),
                     source_type: PathType::File,
+                    source_hash: Utils::hash_file(new_source_path).await.ok(),
                 };
 
                 let outcomes = Self::execute_copy_plans(vec![plan], emit_time).await;
@@ -447,7 +452,7 @@ impl FileOperationsManager {
             return None;
         }
 
-        let current_hash = match Utils::copy_file(
+        match Utils::copy_file(
             &plan.source_path,
             &plan.dest_path,
             &plan.relative_path,
@@ -455,8 +460,13 @@ impl FileOperationsManager {
         )
         .await
         {
-            Ok(hash) => Some(hash),
+            Ok(()) => {}
             Err(()) => return None,
+        };
+
+        let current_hash = match plan.source_hash {
+            Some(hash) => Some(hash),
+            None => Utils::hash_file(&plan.source_path).await.ok(),
         };
 
         Some(CopyOutcome {
@@ -647,6 +657,7 @@ impl FileOperationsManager {
             dest_path,
             relative_path,
             source_type: PathType::File,
+            source_hash: current_hash,
         })
     }
 

@@ -10,7 +10,7 @@ repository = "https://github.com/JulesTanguy/oxsync/"
 [dependencies]
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
-lru = "0.16.3"
+lru = "0.18"
 notify = "8.2.0"
 time = { version = "0.3.47", features = ["formatting", "alloc", "local-offset"] }
 tokio = { version = "1.50", features = ["fs", "io-util", "sync", "rt-multi-thread", "macros", "time"] }
